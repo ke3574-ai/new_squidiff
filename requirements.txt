@@ -1,0 +1,9 @@
+scanpy
+anndata
+rdkit
+torch
+torchvision
+torchaudio
+numpy
+pandas
+matplotlib

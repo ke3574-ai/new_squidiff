@@ -6,6 +6,7 @@ https://github.com/phizaz/diffae
 import copy
 import functools
 import os
+import re
 
 import torch as th
 import torch.distributed as dist
@@ -97,7 +98,7 @@ class TrainLoop:
 
         self.sync_cuda = th.cuda.is_available()
         self.loss_list = []
-        #self._load_and_sync_parameters()
+        self._load_and_sync_parameters()
         self.mp_trainer = MixedPrecisionTrainer(
             model=self.model,
             use_fp16=self.use_fp16,
@@ -143,28 +144,43 @@ class TrainLoop:
         
 
     def _load_and_sync_parameters(self):
-        resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
-
+        """
+        Loads the primary model weights and sets the global resume_step.
+        """
+        print(f"Loading and synching parameters...")
+        # Anchor point: find the latest model file
+        resume_checkpoint = find_resume_checkpoint(self.resume_checkpoint)
+        
         if resume_checkpoint:
+            # Set the step count based on the model filename
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
+            print(f"Detected resume step: {self.resume_step}")
+            
             if dist.get_rank() == 0:
-                logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
+                print(f"Loading model weights from: {resume_checkpoint}")
                 self.model.load_state_dict(
                     dist_util.load_state_dict(
                         resume_checkpoint, map_location=dist_util.dev()
                     )
                 )
+        else:
+            print("No checkpoint found. Starting from scratch (Step 0).")
 
         dist_util.sync_params(self.model.parameters())
 
     def _load_ema_parameters(self, rate):
+        """
+        Loads the EMA weights matching the current resume_step.
+        """
         ema_params = copy.deepcopy(self.mp_trainer.master_params)
-
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+        
+        # Get the anchor model again to find the directory
+        main_checkpoint = find_resume_checkpoint(self.resume_checkpoint)
         ema_checkpoint = find_ema_checkpoint(main_checkpoint, self.resume_step, rate)
+        
         if ema_checkpoint:
             if dist.get_rank() == 0:
-                logger.log(f"loading EMA from checkpoint: {ema_checkpoint}...")
+                print(f"Loading EMA weights ({rate}) from: {ema_checkpoint}")
                 state_dict = dist_util.load_state_dict(
                     ema_checkpoint, map_location=dist_util.dev()
                 )
@@ -174,16 +190,26 @@ class TrainLoop:
         return ema_params
 
     def _load_optimizer_state(self):
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
-        opt_checkpoint = os.path.join(
-            os.path.dirname(main_checkpoint), f"opt{self.resume_step:06}.pt"
-        )
+        """
+        Loads the optimizer state (momentum, etc.) matching the current resume_step.
+        """
+        main_checkpoint = find_resume_checkpoint(self.resume_checkpoint)
+        if not main_checkpoint:
+            return
+
+        checkpoint_dir = os.path.dirname(main_checkpoint)
+        # Logic: /path/to/checkpoints/opt_000560.pt
+        opt_checkpoint = os.path.join(checkpoint_dir, f"opt_{self.resume_step:06d}.pt")
+        
         if os.path.exists(opt_checkpoint):
-            logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
-            state_dict = dist_util.load_state_dict(
-                opt_checkpoint, map_location=dist_util.dev()
-            )
-            self.opt.load_state_dict(state_dict)
+            if dist.get_rank() == 0:
+                print(f"Loading optimizer state from: {opt_checkpoint}")
+                state_dict = dist_util.load_state_dict(
+                    opt_checkpoint, map_location=dist_util.dev()
+                )
+                self.opt.load_state_dict(state_dict)
+        else:
+            print(f"Warning: No optimizer state found at {opt_checkpoint}. Starting with fresh optimizer.")
 
     def run_loop(self):
         while (
@@ -191,9 +217,10 @@ class TrainLoop:
             or self.step + self.resume_step < self.lr_anneal_steps
         ):
            
-            
+            # ADD THIS:
+            if self.step % 10 == 0: # Print every 10 steps so it doesn't spam
+                print(f"--- Training Step: {self.step} / {self.lr_anneal_steps} ---")
             batch = next(iter(self.data))
-
             self.run_step(batch)
             
             
@@ -216,6 +243,7 @@ class TrainLoop:
         if took_step:
             self._update_ema()
         self._anneal_lr()
+        
         self.log_step()
 
     def forward_backward(self, batch):
@@ -239,7 +267,8 @@ class TrainLoop:
             
             last_batch = (i + self.microbatch) >= batch['feature'].shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
-
+            if i == 0 and self.step % 10 == 0:
+              print(f"    Current Diffusion Timesteps (first few in batch): {t[:5].tolist()}")
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
@@ -271,6 +300,9 @@ class TrainLoop:
             self.mp_trainer.backward(loss)
             
         self.loss_list.append(loss)
+        # REACTIVATE AND ENHANCE THIS:
+        if self.step % 10 == 0:
+            print(f"    Step Loss: {loss.item():.4f}")
         #print('loss=',loss)
 
     def _update_ema(self):
@@ -290,46 +322,62 @@ class TrainLoop:
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
 
     def save(self):
+        # Calculate current total step for naming
+        curr_step = self.step + self.resume_step
+
         def save_checkpoint(rate, params):
             state_dict = self.mp_trainer.master_params_to_state_dict(params) if self.mp_trainer else self.model.state_dict()
+            
             if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-                logger.log(f"saving model {rate}...")
+                # Directory check
                 if not os.path.exists(self.resume_checkpoint):
-                    # Directory doesn't exist, so create it
                     os.makedirs(self.resume_checkpoint)
+                
+                # --- NEW CONVENTION LOGIC ---
                 if not rate: 
-                    filepath = os.path.join(self.resume_checkpoint, "model.pt")
+                    # Standard model: model_000560.pt
+                    filename = f"model_{curr_step:06d}.pt"
                 else:
-                    filepath = os.path.join(self.resume_checkpoint, f"model_{rate}.pt")
+                    # EMA model: ema_0.9999_000560.pt
+                    filename = f"ema_{rate}_{curr_step:06d}.pt"
+                
+                print(f"saving model {rate} to {filename}...") 
+                filepath = os.path.join(self.resume_checkpoint, filename)
+                
                 with open(filepath, "wb") as f:
                     th.save(state_dict, f)
 
+        # 1. Save Model and EMA
         save_checkpoint(0, self.mp_trainer.master_params if self.mp_trainer else self.model.parameters())
         for rate, params in zip(self.ema_rate, self.ema_params):
             save_checkpoint(rate, params)
 
+        # 2. Save Optimizer (Matching the opt_XXXXXX.pt convention)
         if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-            opt_filename = f"opt{(self.step+self.resume_step):06d}.pt"
-            opt_filepath = os.path.join(get_blob_logdir(), opt_filename)
+            # Added underscore to 'opt_' to match our unified logic
+            opt_filename = f"opt_{curr_step:06d}.pt"
+            opt_filepath = os.path.join(self.resume_checkpoint, opt_filename)
+            
+            print(f"saving optimizer state to {opt_filename}...")
             with open(opt_filepath, "wb") as f:
                 th.save(self.opt.state_dict(), f)
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-def parse_resume_step_from_filename(filename):
-    """
-    Parse filenames of the form path/to/modelNNNNNN.pt, where NNNNNN is the
-    checkpoint's number of steps.
-    """
-    split = filename.split("model")
-    if len(split) < 2:
-        return 0
-    split1 = split[-1].split(".")[0]
-    try:
-        return int(split1)
-    except ValueError:
-        return 0
+# def parse_resume_step_from_filename(filename):
+#     """
+#     Parse filenames of the form path/to/modelNNNNNN.pt, where NNNNNN is the
+#     checkpoint's number of steps.
+#     """
+#     split = filename.split("model")
+#     if len(split) < 2:
+#         return 0
+#     split1 = split[-1].split(".")[0]
+#     try:
+#         return int(split1)
+#     except ValueError:
+#         return 0
 
 
 def get_blob_logdir():
@@ -337,21 +385,56 @@ def get_blob_logdir():
     # a blobstore or some external drive.
     return logger.get_dir()
 
-
-def find_resume_checkpoint():
-    # On your infrastructure, you may want to override this to automatically
-    # discover the latest checkpoint on your blob storage, etc.
-    return None
-
-
-def find_ema_checkpoint(main_checkpoint, step, rate):
-    if main_checkpoint is None:
+def find_resume_checkpoint(checkpoint_dir_or_file):
+    """
+    Unified anchor: Finds the latest model file in a directory OR returns the file path if provided.
+    Returns: A full string path to a .pt file (e.g., 'checkpoints/model_000560.pt') or None.
+    """
+    if not checkpoint_dir_or_file:
         return None
-    filename = f"ema_{rate}_{(step):06d}.pt"
-    path = os.path.join(os.path.dirname(main_checkpoint), filename)
-    if os.path.exists(path):
-        return path
+
+    # If the user passed a specific file already, just return it
+    if os.path.isfile(checkpoint_dir_or_file):
+        return checkpoint_dir_or_file
+
+    # If it's a directory, look for the highest 'model_XXXXXX.pt'
+    if os.path.isdir(checkpoint_dir_or_file):
+        files = [f for f in os.listdir(checkpoint_dir_or_file) if f.startswith("model_") and f.endswith(".pt")]
+        if not files:
+            # Check for the old 'model.pt' format as a secondary fallback
+            fallback = os.path.join(checkpoint_dir_or_file, "model.pt")
+            return fallback if os.path.exists(fallback) else None
+        
+        # Sorting 'model_000100.pt' vs 'model_000560.pt' works alphabetically
+        files.sort()
+        return os.path.join(checkpoint_dir_or_file, files[-1])
+    
     return None
+
+def parse_resume_step_from_filename(filename):
+    """
+    Uses regex to find the step number in filenames like 'model_000560.pt' or 'model000560.pt'.
+    Returns: Integer (e.g., 560) or 0 if no number is found.
+    """
+    basename = os.path.basename(filename)
+    # This regex looks for any sequence of digits in the filename
+    match = re.search(r"(\d+)", basename)
+    if match:
+        return int(match.group(1))
+    return 0
+
+def find_ema_checkpoint(main_checkpoint_path, step, rate):
+    """
+    Constructs the EMA path based on the directory of the main model and the current step.
+    Returns: Full path to the EMA file if it exists, else None.
+    """
+    if main_checkpoint_path is None:
+        return None
+    checkpoint_dir = os.path.dirname(main_checkpoint_path)
+    # Logic: /path/to/checkpoints/ema_0.9999_000560.pt
+    filename = f"ema_{rate}_{step:06d}.pt"
+    path = os.path.join(checkpoint_dir, filename)
+    return path if os.path.exists(path) else None
 
 
 def log_loss_dict(diffusion, ts, losses):
