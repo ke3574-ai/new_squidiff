@@ -25,6 +25,16 @@ from Squidiff.train_util import TrainLoop,plot_loss
 
 GPUS_PER_NODE = 1  # Set this to the actual number of GPUs per node
 
+# Set environment variables for a single-node local setup
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '12395'
+
+# Initialize the process group using the 'gloo' backend (best for CPU)
+if not dist.is_initialized():
+    dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    print("Distributed process group initialized on CPU.")
+
+
 def load_state_dict(path, **kwargs):
     """
     Load a PyTorch file without redundant fetches across ranks.
