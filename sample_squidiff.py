@@ -157,23 +157,147 @@ class sampler:
                 )
         return pred_result
     
-    def interp_with_direction(self, z_sem_origin = None, gene_size = None, direction = None, scale = 1, add_noise_term = True):
+    # def interp_with_direction(self, z_sem_origin = None, gene_size = None, direction = None, scale = 1, add_noise_term = True):
 
-        z_sem_origin = z_sem_origin.detach().cpu().numpy()
-        z_sem_interp_ = z_sem_origin.mean(axis=0) + direction.detach().cpu().numpy() * scale
+    #     z_sem_origin = z_sem_origin.detach().cpu().numpy()
+    #     z_sem_interp_ = z_sem_origin.mean(axis=0) + direction.detach().cpu().numpy() * scale
+    #     if add_noise_term:
+    #         z_sem_interp_ = self.sample_around_point(z_sem_interp_, num_samples=z_sem_origin.shape[0])
+
+    #     z_sem_interp_ = torch.tensor(z_sem_interp_,dtype=torch.float32).to('cpu')
+    #     sample_interp = self.sample_fn(
+    #                         self.model,
+    #                         shape = (z_sem_origin.shape[0],gene_size),
+    #                         model_kwargs={
+    #                             'z_mod': z_sem_interp_
+    #                         },
+    #                         noise =  None
+    #     )
+    #     return sample_interp
+    
+    # def interp_with_direction(
+    #     self,
+    #     z_sem_origin=None,
+    #     gene_size=None,
+    #     direction=None,
+    #     scale=1,
+    #     add_noise_term=True,
+    # ):
+    #     # --- infer device from model ---
+    #     device = next(self.model.parameters()).device
+
+    #     # --- ensure tensors are on correct device ---
+    #     if not isinstance(z_sem_origin, torch.Tensor):
+    #         z_sem_origin = torch.tensor(z_sem_origin, dtype=torch.float32)
+    #     z_sem_origin = z_sem_origin.to(device)
+
+    #     if not isinstance(direction, torch.Tensor):
+    #         direction = torch.tensor(direction, dtype=torch.float32)
+    #     direction = direction.to(device)
+
+    #     # --- compute mean latent ---
+    #     z_mean = z_sem_origin.mean(dim=0)
+
+    #     # --- interpolate ---
+    #     z_sem_interp = z_mean + direction * scale
+
+    #     # --- sample around point ---
+    #     if add_noise_term:
+    #         # keep noise in torch (preferred)
+    #         num_samples = z_sem_origin.shape[0]
+    #         noise = torch.randn(
+    #             (num_samples, z_sem_interp.shape[0]),
+    #             device=device,
+    #             dtype=z_sem_interp.dtype,
+    #         )
+    #         z_sem_interp = z_sem_interp.unsqueeze(0) + noise
+    #     else:
+    #         z_sem_interp = z_sem_interp.unsqueeze(0).repeat(
+    #             z_sem_origin.shape[0], 1
+    #         )
+
+    #     # --- sampling ---
+    #     sample_interp = self.sample_fn(
+    #         self.model,
+    #         shape=(z_sem_origin.shape[0], gene_size),
+    #         model_kwargs={"z_mod": z_sem_interp},
+    #         noise=None,
+    #     )
+
+    #     return sample_interp
+    
+    def interp_with_direction(
+        self,
+        z_sem_origin=None,
+        gene_size=None,
+        direction=None,
+        scale=1,
+        add_noise_term=True,
+        use_mean=True,   # <-- new flag
+    ):
+        device = next(self.model.parameters()).device
+
+        # --- ensure tensors ---
+        if not isinstance(z_sem_origin, torch.Tensor):
+            z_sem_origin = torch.tensor(z_sem_origin, dtype=torch.float32)
+        z_sem_origin = z_sem_origin.to(device)
+
+        if not isinstance(direction, torch.Tensor):
+            direction = torch.tensor(direction, dtype=torch.float32)
+        direction = direction.to(device)
+
+        num_samples = z_sem_origin.shape[0]
+
+        # =========================
+        # Core difference
+        # =========================
+        if use_mean:
+            # mean-field (Squidiff default)
+            z_base = z_sem_origin.mean(dim=0)              # (D,)
+            z_sem_interp = z_base + direction * scale      # (D,)
+            z_sem_interp = z_sem_interp.unsqueeze(0).repeat(num_samples, 1)
+
+        else:
+            # per-cell transport (your experiment)
+            z_sem_interp = z_sem_origin + direction * scale   # (N, D)
+
+        # =========================
+        # Noise
+        # =========================
         if add_noise_term:
-            z_sem_interp_ = self.sample_around_point(z_sem_interp_, num_samples=z_sem_origin.shape[0])
+            noise = torch.randn_like(z_sem_interp)
+            z_sem_interp = z_sem_interp + noise
 
-        z_sem_interp_ = torch.tensor(z_sem_interp_,dtype=torch.float32).to('cuda')
+        # =========================
+        # Sampling
+        # =========================
         sample_interp = self.sample_fn(
-                            self.model,
-                            shape = (z_sem_origin.shape[0],gene_size),
-                            model_kwargs={
-                                'z_mod': z_sem_interp_
-                            },
-                            noise =  None
+            self.model,
+            shape=(num_samples, gene_size),
+            model_kwargs={"z_mod": z_sem_interp},
+            noise=None,
         )
+
         return sample_interp
+    
+    def reconstruct_from_latent(self, z_sem_origin, gene_size):
+        device = next(self.model.parameters()).device
+
+        if not isinstance(z_sem_origin, torch.Tensor):
+            z_sem_origin = torch.tensor(z_sem_origin, dtype=torch.float32)
+        z_sem_origin = z_sem_origin.to(device)
+
+        # NO mean, NO direction
+        z_sem_interp = z_sem_origin
+
+        sample = self.sample_fn(
+            self.model,
+            shape=(z_sem_origin.shape[0], gene_size),
+            model_kwargs={"z_mod": z_sem_interp},
+            noise=None,
+        )
+
+        return sample
         
     def cal_metric(self,x1,x2):
         r2 = r2_score(x1.detach().cpu().numpy().mean(axis=0),
